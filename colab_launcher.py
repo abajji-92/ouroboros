@@ -456,6 +456,29 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
             send_with_budget(chat_id, f"🧠 Background consciousness: {bg_status}")
         return f"[Supervisor handled /bg {action}]\n"
 
+    if lowered.startswith("/budget"):
+        parts = text.strip().split()
+        if len(parts) >= 2:
+            try:
+                new_limit = float(parts[1])
+                from supervisor.state import set_budget_limit as _sbl
+                _sbl(new_limit)  # Also persists to state.json
+                st2 = load_state()
+                spent = float(st2.get("spent_usd") or 0)
+                remaining = max(0.0, new_limit - spent)
+                send_with_budget(chat_id, f"💰 Budget limit updated: ${new_limit:.2f} total (${remaining:.2f} remaining)")
+                return True
+            except (ValueError, IndexError):
+                send_with_budget(chat_id, "⚠️ Usage: /budget <amount> (e.g. /budget 15)")
+                return True
+        else:
+            st2 = load_state()
+            spent = float(st2.get("spent_usd") or 0)
+            from supervisor.state import TOTAL_BUDGET_LIMIT as _tbl
+            remaining = max(0.0, _tbl - spent)
+            send_with_budget(chat_id, f"💰 Budget: ${_tbl:.2f} total, ${spent:.2f} spent, ${remaining:.2f} remaining")
+            return True
+
     return ""
 
 

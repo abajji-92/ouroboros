@@ -229,6 +229,11 @@ def init_state() -> Dict[str, Any]:
             # If we can't fetch ground truth, use 0 as baseline
             st["session_total_snapshot"] = 0.0
 
+        # If budget_total_usd was persisted (e.g. via /budget command), apply it
+        persisted_limit = st.get("budget_total_usd")
+        if persisted_limit and float(persisted_limit) > 0:
+            set_budget_limit(float(persisted_limit))
+
         # Reset drift tracking
         st["budget_drift_pct"] = None
         st["budget_drift_alert"] = False
@@ -247,9 +252,20 @@ EVOLUTION_BUDGET_RESERVE: float = 50.0  # Stop evolution when remaining < this
 
 
 def set_budget_limit(limit: float) -> None:
-    """Set total budget limit for budget_pct calculation."""
+    """Set total budget limit for budget_pct calculation. Persists to state.json."""
     global TOTAL_BUDGET_LIMIT
     TOTAL_BUDGET_LIMIT = limit
+    # Persist so restarts pick up the updated limit
+    try:
+        lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+        try:
+            st = _load_state_unlocked()
+            st["budget_total_usd"] = limit
+            _save_state_unlocked(st)
+        finally:
+            release_file_lock(STATE_LOCK_PATH, lock_fd)
+    except Exception:
+        pass  # Non-fatal if persistence fails
 
 
 def budget_remaining(st: Dict[str, Any]) -> float:
