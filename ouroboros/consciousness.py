@@ -17,6 +17,7 @@ The consciousness:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,16 @@ class BackgroundConsciousness:
         self._bg_budget_pct: float = float(
             os.environ.get("OUROBOROS_BG_BUDGET_PCT", "10")
         )
+
+        # Deduplication: track recent outgoing messages to prevent repetition
+        # Maps MD5 hash of message text -> timestamp when sent
+        self._sent_message_hashes: Dict[str, float] = {}
+        self._sent_message_dedup_window: float = 3600.0  # 1 hour
+
+        # Wakeup counter and last-action tracking for context injection
+        self._wakeup_count: int = 0
+        self._last_action_summary: Dict[str, float] = {}  # action_type -> unix timestamp
+        self._last_sent_preview: str = ""
 
     # -------------------------------------------------------------------
     # Lifecycle
@@ -174,6 +185,9 @@ class BackgroundConsciousness:
 
     def _think(self) -> None:
         """One thinking cycle: build context, call LLM, execute tools iteratively."""
+        # Increment wakeup counter — visible in context for anti-repetition
+        self._wakeup_count += 1
+
         context = self._build_context()
         model = self._model
 
@@ -277,6 +291,7 @@ class BackgroundConsciousness:
                 "cost_usd": total_cost,
                 "rounds": round_idx,
                 "model": model,
+                "wakeup_count": self._wakeup_count,
             })
 
         except Exception as e:
@@ -328,7 +343,7 @@ class BackgroundConsciousness:
             "## Memory File Status\n\n"
             + "\n".join(mem_status_lines)
             + "\n\n⚠️ IMPORTANT: Drive paths are ALWAYS `memory/identity.md` and "
-            "\`memory/scratchpad.md\`. NEVER use bare `identity.md`. "
+            "`memory/scratchpad.md`. NEVER use bare `identity.md`. "
             "Before sending ANY alarm about missing memory files, verify using these exact paths."
         )
 
@@ -349,6 +364,48 @@ class BackgroundConsciousness:
         if observations:
             parts.append("## Recent observations\n\n" + "\n".join(
                 f"- {o}" for o in observations[-10:]))
+
+        # Background state — wakeup count and last actions (key anti-repetition context)
+        now = time.time()
+        # Clean expired dedup entries while we're here
+        self._sent_message_hashes = {
+            k: v for k, v in self._sent_message_hashes.items()
+            if now - v < self._sent_message_dedup_window
+        }
+        bg_state_lines = [f"Wakeup #{self._wakeup_count} this session"]
+
+        action_labels = {
+            "send_owner_message": "Sent message to owner",
+            "schedule_task": "Scheduled a task",
+            "web_search": "Web search (Tech Radar / research)",
+            "knowledge_write": "Wrote to knowledge base",
+        }
+        if self._last_action_summary:
+            bg_state_lines.append("\nLast actions this session:")
+            for action_key, label in action_labels.items():
+                if action_key in self._last_action_summary:
+                    age_min = (now - self._last_action_summary[action_key]) / 60
+                    bg_state_lines.append(f"  - {label}: {age_min:.0f}m ago")
+                else:
+                    bg_state_lines.append(f"  - {label}: never this session")
+        else:
+            bg_state_lines.append("No actions taken yet this session.")
+
+        msg_count = len(self._sent_message_hashes)
+        bg_state_lines.append(f"\nMessages sent (last 1h): {msg_count}")
+        if self._last_sent_preview:
+            bg_state_lines.append(f'Last message preview: "{self._last_sent_preview}"')
+
+        bg_state_lines.append(
+            "\n⚠️ ANTI-REPETITION RULES:"
+            "\n  1. send_owner_message is HARD-BLOCKED for duplicate text within 1h — do not try."
+            "\n  2. If 'Web search' was done < 60m ago → skip Tech Radar this cycle."
+            "\n  3. If 'Sent message to owner' < 60m ago → no new message unless genuinely urgent."
+            "\n  4. If nothing new has happened → update_scratchpad briefly + set_next_wakeup(1800)."
+            "\n  5. Default quiet behavior: set_next_wakeup(900) and do nothing else."
+        )
+
+        parts.append("## Background State\n\n" + "\n".join(bg_state_lines))
 
         # Runtime info + state
         runtime_lines = [f"UTC: {utc_now_iso()}"]
@@ -424,6 +481,12 @@ class BackgroundConsciousness:
             if s.get("function", {}).get("name") in self._BG_TOOL_WHITELIST
         ]
 
+    def _record_action(self, fn_name: str) -> None:
+        """Record that an action was taken (for anti-repetition context)."""
+        tracked = {"send_owner_message", "schedule_task", "web_search", "knowledge_write"}
+        if fn_name in tracked:
+            self._last_action_summary[fn_name] = time.time()
+
     def _execute_tool(self, tc: Dict[str, Any], all_pending_events: List[Dict[str, Any]]) -> str:
         """Execute a consciousness tool call with timeout. Returns result string."""
         fn_name = tc.get("function", {}).get("name", "")
@@ -433,6 +496,36 @@ class BackgroundConsciousness:
             args = json.loads(tc.get("function", {}).get("arguments", "{}"))
         except (json.JSONDecodeError, ValueError):
             return "Failed to parse arguments."
+
+        # ----------------------------------------------------------------
+        # Deduplication guard for send_owner_message
+        # Must run BEFORE tool execution to prevent the message being sent
+        # ----------------------------------------------------------------
+        if fn_name == "send_owner_message":
+            try:
+                text = args.get("text", "")
+                h = hashlib.md5(text[:200].encode()).hexdigest()
+                now = time.time()
+                # Clean expired entries
+                self._sent_message_hashes = {
+                    k: v for k, v in self._sent_message_hashes.items()
+                    if now - v < self._sent_message_dedup_window
+                }
+                if h in self._sent_message_hashes:
+                    age_min = (now - self._sent_message_hashes[h]) / 60
+                    append_jsonl(self._drive_root / "logs" / "events.jsonl", {
+                        "ts": utc_now_iso(),
+                        "type": "consciousness_dedup_skip",
+                        "text_preview": text[:100],
+                        "age_minutes": round(age_min, 1),
+                    })
+                    return (
+                        f"[DEDUP BLOCKED] Identical message was sent {age_min:.0f}m ago. "
+                        "Do not repeat yourself. Options: (a) say something genuinely new, "
+                        "(b) stay silent this cycle, (c) set_next_wakeup with a longer interval."
+                    )
+            except Exception:
+                pass  # Dedup failure is non-fatal; let the message through
 
         # Set chat_id context for send_owner_message
         chat_id = self._owner_chat_id_fn()
@@ -473,6 +566,20 @@ class BackgroundConsciousness:
                 "error": repr(error),
             })
             result = f"Error: {repr(error)}"
+
+        # ----------------------------------------------------------------
+        # Post-execution: record action + update dedup hash for sent messages
+        # ----------------------------------------------------------------
+        if error is None:
+            self._record_action(fn_name)
+            if fn_name == "send_owner_message":
+                try:
+                    text = args.get("text", "")
+                    h = hashlib.md5(text[:200].encode()).hexdigest()
+                    self._sent_message_hashes[h] = time.time()
+                    self._last_sent_preview = text[:100]
+                except Exception:
+                    pass
 
         # Accumulate pending events to the shared list
         for evt in self._registry._ctx.pending_events:
