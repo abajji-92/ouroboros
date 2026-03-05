@@ -369,6 +369,8 @@ class BackgroundConsciousness:
         # Memory & identity
         "send_owner_message", "schedule_task", "update_scratchpad",
         "update_identity", "set_next_wakeup",
+        # Direct Drive writes (for explicit file saves to Drive)
+        "drive_write",
         # Knowledge base
         "knowledge_read", "knowledge_write", "knowledge_list",
         # Read-only tools for awareness
