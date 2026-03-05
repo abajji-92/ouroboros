@@ -318,6 +318,20 @@ class BackgroundConsciousness:
             parts.append("## Scratchpad\n\n" + clip_text(
                 read_text(scratchpad_path), 8000))
 
+        # Memory file status — explicit check to prevent false "missing" alarms
+        # The model must ALWAYS use path memory/identity.md and memory/scratchpad.md
+        mem_status_lines = [
+            f"identity.md: {'EXISTS' if identity_path.exists() else 'MISSING'} (Drive path: memory/identity.md)",
+            f"scratchpad.md: {'EXISTS' if scratchpad_path.exists() else 'MISSING'} (Drive path: memory/scratchpad.md)",
+        ]
+        parts.append(
+            "## Memory File Status\n\n"
+            + "\n".join(mem_status_lines)
+            + "\n\n⚠️ IMPORTANT: Drive paths are ALWAYS `memory/identity.md` and "
+            "\`memory/scratchpad.md\`. NEVER use bare `identity.md`. "
+            "Before sending ANY alarm about missing memory files, verify using these exact paths."
+        )
+
         # Dialogue summary for continuity
         summary_path = self._drive_root / "memory" / "dialogue_summary.md"
         if summary_path.exists():
